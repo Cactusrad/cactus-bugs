@@ -1,0 +1,65 @@
+name: Bugs Service CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  backend-lint:
+    name: Backend Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint backend
+        continue-on-error: true
+        run: ruff check . --select=E,F,W --ignore=E501
+
+  backend-tests:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest test_bugs.py -v --tb=short
+
+  notify:
+    name: Discord Notification
+    needs: [backend-lint, backend-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify failure
+        if: contains(needs.*.result, 'failure')
+        run: |
+          curl -s -H "Content-Type: application/json" \
+            -d '{"username":"CI/CD Cactus","embeds":[{"title":"CI ECHEC - bugs_service","color":16711680,"fields":[{"name":"Branch","value":"${{ github.ref_name }}","inline":true},{"name":"Run","value":"[Voir les logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})","inline":false}],"footer":{"text":"GitHub Actions"}}]}' \
+            ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      - name: Notify success
+        if: "!contains(needs.*.result, 'failure')"
+        run: |
+          curl -s -H "Content-Type: application/json" \
+            -d '{"username":"CI/CD Cactus","embeds":[{"title":"CI OK - bugs_service","color":65280,"fields":[{"name":"Branch","value":"${{ github.ref_name }}","inline":true}],"footer":{"text":"GitHub Actions"}}]}' \
+            ${{ secrets.DISCORD_WEBHOOK_URL }}

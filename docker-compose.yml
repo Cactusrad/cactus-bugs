@@ -1,0 +1,56 @@
+services:
+  bugs-backend:
+    build: .
+    container_name: bugs-backend
+    restart: unless-stopped
+    expose:
+      - "8000"
+    volumes:
+      - ./data/db:/app/data
+      - ./data/uploads:/app/uploads
+      - ./data/backups:/app/backups
+    environment:
+      - TZ=America/Toronto
+      - ADMIN_MASTER_KEY=${ADMIN_MASTER_KEY:?Set ADMIN_MASTER_KEY in .env}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - bugs-network
+
+  bugs-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    container_name: bugs-frontend
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:9010:80"
+    depends_on:
+      bugs-backend:
+        condition: service_healthy
+    networks:
+      - bugs-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:80/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+      retries: 3
+
+networks:
+  bugs-network:
+    driver: bridge
