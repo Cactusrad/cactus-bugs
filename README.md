@@ -873,6 +873,260 @@ On first startup (empty database), a default admin is created:
 
 ---
 
+## Health Check Monitoring Integration
+
+The bugs service can receive **automatic bug reports from a health monitor**. When a service goes down, a bug is created. When it comes back up, the bug is auto-resolved. This creates a full incident log with exact downtime tracking.
+
+### How It Works
+
+```
+Health Monitor                    Bugs Service                    Webhook Listener
+(polls every 60s)                 (port 9010)                     (port 9876)
+
+ 1. GET /health ──> Service
+    Response: timeout/error
+
+ 2. fail_count++
+    (retry after 60s)
+
+ 3. 2nd failure = DOWN
+    POST /api/v1/issues ────────> 4. Create issue BUG-042
+    {                                 (priority: critique)
+      type: "bug",
+      title: "[MONITOR]              5. Trigger webhook ──────────> 6. Receive notification
+        MyApp is DOWN",                  POST to webhook_url           - Sync bug to local files
+      priority: "critique",                                            - Send Telegram alert
+      reporter: "Health Monitor"                                       - Send Discord alert
+    }
+
+    ... service is down ...
+
+ 7. Service responds again!
+    POST /comments ──────────────> 8. Add resolution comment
+    {                                  "MyApp is back.
+      author: "Health Monitor",         Downtime: 12m 34s"
+      content: "Back online.
+        Downtime: 12m 34s"        9. PATCH /status ──────────────> Auto-close BUG-042
+    }                                  {status: "termine"}
+```
+
+### Setting Up a Health Monitor
+
+#### 1. Create a project for your monitor
+
+```bash
+export ADMIN_KEY="your_admin_master_key"
+
+curl -X POST "http://localhost:9010/api/v1/admin/projects" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Health Monitor",
+    "slug": "health-monitor",
+    "webhook_url": "http://your-webhook-listener:9876"
+  }'
+```
+
+Save the returned `api_key`.
+
+#### 2. Monitor script (Python example)
+
+```python
+"""
+Minimal health monitor that creates/resolves bugs automatically.
+Run as a cron job or long-running service.
+"""
+import time
+import requests
+from datetime import datetime
+
+BUGS_API = "http://localhost:9010/api/v1"
+API_KEY = "YOUR_HEALTH_MONITOR_API_KEY"
+CHECK_INTERVAL = 60  # seconds
+RETRIES_BEFORE_DOWN = 2
+
+SERVICES = [
+    {"name": "My Web App", "url": "http://localhost:3000/health", "port": 3000},
+    {"name": "My API",     "url": "http://localhost:8080/health", "port": 8080},
+    {"name": "Database",   "url": "http://localhost:5432/",       "port": 5432},
+]
+
+# Track state per service
+states = {s["name"]: {"status": "up", "fail_count": 0, "bug_ref": None, "down_since": None}
+          for s in SERVICES}
+
+
+def check_health(url, timeout=10):
+    """Returns True if service responds with 2xx."""
+    try:
+        r = requests.get(url, timeout=timeout)
+        return r.status_code < 400
+    except Exception:
+        return False
+
+
+def bugs_request(method, path, data=None):
+    """Authenticated request to bugs service."""
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    r = requests.request(method, f"{BUGS_API}{path}", json=data, headers=headers, timeout=10)
+    return r.json() if r.ok else None
+
+
+def create_down_bug(name, url, port):
+    """Create a critical bug when service goes DOWN."""
+    result = bugs_request("POST", "/issues", {
+        "type": "bug",
+        "title": f"[MONITOR] {name} is DOWN (port {port})",
+        "description": (
+            f"Health monitor detected that **{name}** is not responding.\n\n"
+            f"- **URL:** {url}\n"
+            f"- **Port:** {port}\n"
+            f"- **Detected at:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"- **Consecutive failures:** {RETRIES_BEFORE_DOWN}"
+        ),
+        "priority": "critique",
+        "reporter": "Health Monitor",
+    })
+    return result.get("reference") if result else None
+
+
+def resolve_bug(reference, name, downtime):
+    """Add resolution comment and close the bug."""
+    bugs_request("POST", f"/issues/{reference}/comments", {
+        "author": "Health Monitor",
+        "content": f"**{name}** is back online. Downtime: {downtime}.",
+    })
+    bugs_request("PATCH", f"/issues/{reference}/status", {
+        "status": "termine",
+        "comment": f"Auto-resolved. Downtime: {downtime}",
+    })
+
+
+def format_duration(td):
+    """Format timedelta as human-readable string."""
+    total_seconds = int(td.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+# Main loop
+while True:
+    for service in SERVICES:
+        name = service["name"]
+        state = states[name]
+        alive = check_health(service["url"])
+
+        if alive:
+            if state["status"] == "down":
+                # Service restored!
+                downtime = format_duration(datetime.now() - state["down_since"])
+                if state["bug_ref"]:
+                    resolve_bug(state["bug_ref"], name, downtime)
+                    print(f"[RESOLVED] {name} back online after {downtime} (bug {state['bug_ref']})")
+                state["status"] = "up"
+                state["bug_ref"] = None
+                state["down_since"] = None
+            state["fail_count"] = 0
+
+        else:
+            state["fail_count"] += 1
+            if state["fail_count"] >= RETRIES_BEFORE_DOWN and state["status"] == "up":
+                # Service is DOWN
+                state["status"] = "down"
+                state["down_since"] = datetime.now()
+                ref = create_down_bug(name, service["url"], service["port"])
+                state["bug_ref"] = ref
+                print(f"[DOWN] {name} — created bug {ref}")
+
+    time.sleep(CHECK_INTERVAL)
+```
+
+#### 3. Webhook listener (optional, for notifications)
+
+If you configure a `webhook_url` on the project, the bugs service sends a POST on every new issue:
+
+```json
+{
+  "event": "issue_created",
+  "project": {"id": 1, "name": "Health Monitor", "slug": "health-monitor"},
+  "issue": {
+    "reference": "BUG-042",
+    "type": "bug",
+    "title": "[MONITOR] My API is DOWN (port 8080)",
+    "priority": "critique",
+    "status": "nouveau",
+    "reporter": "Health Monitor",
+    "created_at": "2026-03-08T14:30:00"
+  }
+}
+```
+
+Use this to trigger Slack/Discord/Telegram/PagerDuty notifications.
+
+**Simple webhook receiver example:**
+
+```python
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import json
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        payload = json.loads(body)
+
+        issue = payload["issue"]
+        project = payload["project"]
+        print(f"New bug: {issue['reference']} — {issue['title']} ({project['name']})")
+
+        # Send to Slack, Discord, Telegram, etc.
+        # send_slack_notification(issue)
+        # send_discord_embed(issue)
+
+        self.send_response(200)
+        self.end_headers()
+
+HTTPServer(("0.0.0.0", 9876), WebhookHandler).serve_forever()
+```
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Auto-create bugs** | Service DOWN -> critical bug created automatically |
+| **Auto-resolve bugs** | Service UP -> bug closed with downtime in comment |
+| **Downtime tracking** | Exact duration recorded (e.g. "12m 34s") |
+| **Flap protection** | Optional: suppress alerts if service bounces >5 times in 10 min |
+| **Webhook notifications** | POST to any URL on issue creation |
+| **Audit trail** | Full history: when it went down, who resolved it, how long |
+| **Multi-service** | Monitor as many services as needed, all report to same tracker |
+
+### What Gets Stored Per Incident
+
+Each DOWN event creates a bug with:
+
+```
+Title:       [MONITOR] My API is DOWN (port 8080)
+Type:        bug
+Priority:    critique
+Reporter:    Health Monitor
+Status:      nouveau -> en_cours -> termine (auto-resolved)
+
+Comments:
+  - [Health Monitor] My API is back online. Downtime: 12m 34s.
+
+History:
+  - status: nouveau -> termine (by: Health Monitor)
+```
+
+This gives you a **complete incident log** searchable via the API or dashboard.
+
+---
+
 ## Development
 
 ### Run without Docker
