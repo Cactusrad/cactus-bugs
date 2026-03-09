@@ -103,6 +103,13 @@ The killer feature: a **floating button** that your users click to report bugs d
 ```
 User clicks bug button -> Modal opens -> User fills title + description
                                       -> Optional: capture screenshot
+                                            |
+                                            v
+                                     Annotate screenshot (fullscreen editor)
+                                     Draw, add text, erase, pick colors
+                                     Save -> flattened PNG replaces screenshot
+                                            |
+                                            v
                                       -> Submit
                                             |
                                             v
@@ -126,7 +133,7 @@ npm install html2canvas  # For screenshot capture
 
 ```tsx
 // BugReportButton.tsx
-import { useState } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 
 interface BugReportProps {
   apiUrl: string;       // Your bugs service URL (e.g. "http://localhost:9010")
@@ -135,6 +142,254 @@ interface BugReportProps {
   reporter?: string;    // Pre-fill reporter name
 }
 
+// --- Annotation Editor Sub-component ---
+type Stroke = { points: {x: number; y: number}[]; color: string; width: number; isErased: boolean };
+type TextAnnotation = { id: string; x: number; y: number; text: string; color: string; fontSize: number };
+type AnnotationTool = 'pen' | 'text' | 'eraser';
+const ANNOTATION_COLORS = ['#FF3B30', '#007AFF', '#34C759', '#FFCC00', '#FFFFFF'];
+
+function AnnotationEditor({ imageDataUrl, onSave, onCancel }: {
+  imageDataUrl: string;
+  onSave: (file: File) => void;
+  onCancel: () => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [tool, setTool] = useState<AnnotationTool>('pen');
+  const [color, setColor] = useState(ANNOTATION_COLORS[0]);
+  const [strokes, setStrokes] = useState<Stroke[]>([]);
+  const [texts, setTexts] = useState<TextAnnotation[]>([]);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [imgSize, setImgSize] = useState({ w: 0, h: 0 });
+  const currentStroke = useRef<Stroke | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+
+  // Load image and set canvas size
+  useEffect(() => {
+    const img = new Image();
+    img.onload = () => {
+      imgRef.current = img;
+      setImgSize({ w: img.width, h: img.height });
+    };
+    img.src = imageDataUrl;
+  }, [imageDataUrl]);
+
+  // Redraw canvas whenever strokes change
+  const redraw = useCallback(() => {
+    const canvas = canvasRef.current;
+    const img = imgRef.current;
+    if (!canvas || !img) return;
+    const ctx = canvas.getContext('2d')!;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0);
+    strokes.forEach(s => {
+      if (s.isErased || s.points.length < 2) return;
+      ctx.beginPath();
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = s.width;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.moveTo(s.points[0].x, s.points[0].y);
+      s.points.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+      ctx.stroke();
+    });
+  }, [strokes]);
+
+  useEffect(() => { redraw(); }, [redraw, imgSize]);
+
+  const getCanvasCoords = (e: React.MouseEvent | React.TouchEvent) => {
+    const canvas = canvasRef.current!;
+    const rect = canvas.getBoundingClientRect();
+    const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
+    const clientY = 'touches' in e ? e.touches[0].clientY : e.clientY;
+    return {
+      x: (clientX - rect.left) * (canvas.width / rect.width),
+      y: (clientY - rect.top) * (canvas.height / rect.height),
+    };
+  };
+
+  const handlePointerDown = (e: React.MouseEvent | React.TouchEvent) => {
+    if ('touches' in e) e.preventDefault();
+    if (tool === 'text') e.preventDefault(); // Prevent canvas from stealing focus from contenteditable
+    const pos = getCanvasCoords(e);
+
+    if (tool === 'pen') {
+      currentStroke.current = { points: [pos], color, width: 3, isErased: false };
+      setIsDrawing(true);
+    } else if (tool === 'eraser') {
+      setStrokes(prev => {
+        const updated = [...prev];
+        for (let i = updated.length - 1; i >= 0; i--) {
+          const s = updated[i];
+          if (s.isErased) continue;
+          const hit = s.points.some(p => Math.hypot(p.x - pos.x, p.y - pos.y) < 12);
+          if (hit) { updated[i] = { ...s, isErased: true }; break; }
+        }
+        return updated;
+      });
+    } else if (tool === 'text') {
+      const id = 'txt-' + Date.now();
+      const canvas = canvasRef.current!;
+      const rect = canvas.getBoundingClientRect();
+      const cssX = pos.x * (rect.width / canvas.width);
+      const cssY = pos.y * (rect.height / canvas.height);
+      setTexts(prev => [...prev, { id, x: cssX, y: cssY, text: '', color, fontSize: 16 }]);
+    }
+  };
+
+  const handlePointerMove = (e: React.MouseEvent | React.TouchEvent) => {
+    if ('touches' in e) e.preventDefault();
+    if (!isDrawing || tool !== 'pen' || !currentStroke.current) return;
+    const pos = getCanvasCoords(e);
+    currentStroke.current.points.push(pos);
+    const canvas = canvasRef.current!;
+    const ctx = canvas.getContext('2d')!;
+    const pts = currentStroke.current.points;
+    if (pts.length >= 2) {
+      ctx.beginPath();
+      ctx.strokeStyle = currentStroke.current.color;
+      ctx.lineWidth = currentStroke.current.width;
+      ctx.lineCap = 'round';
+      ctx.moveTo(pts[pts.length - 2].x, pts[pts.length - 2].y);
+      ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+      ctx.stroke();
+    }
+  };
+
+  const handlePointerUp = () => {
+    if (isDrawing && currentStroke.current && currentStroke.current.points.length >= 2) {
+      setStrokes(prev => [...prev, currentStroke.current!]);
+    }
+    currentStroke.current = null;
+    setIsDrawing(false);
+  };
+
+  const handleTextBlur = (id: string, newText: string) => {
+    if (!newText.trim()) {
+      // Delay removal to avoid race condition with mouseup stealing focus
+      setTimeout(() => {
+        setTexts(prev => prev.filter(t => t.id !== id));
+      }, 200);
+    } else {
+      setTexts(prev => prev.map(t => t.id === id ? { ...t, text: newText } : t));
+    }
+  };
+
+  const handleSave = () => {
+    const canvas = canvasRef.current;
+    const img = imgRef.current;
+    if (!canvas || !img) return;
+    const offscreen = document.createElement('canvas');
+    offscreen.width = img.width;
+    offscreen.height = img.height;
+    const ctx = offscreen.getContext('2d')!;
+    ctx.drawImage(img, 0, 0);
+    strokes.forEach(s => {
+      if (s.isErased || s.points.length < 2) return;
+      ctx.beginPath();
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = s.width;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.moveTo(s.points[0].x, s.points[0].y);
+      s.points.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+      ctx.stroke();
+    });
+    const displayCanvas = canvasRef.current!;
+    const rect = displayCanvas.getBoundingClientRect();
+    const scaleX = img.width / rect.width;
+    const scaleY = img.height / rect.height;
+    texts.forEach(t => {
+      if (!t.text.trim()) return;
+      ctx.font = `bold ${t.fontSize * scaleY}px sans-serif`;
+      ctx.fillStyle = t.color;
+      ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+      ctx.lineWidth = 3;
+      ctx.strokeText(t.text, t.x * scaleX, t.y * scaleY + t.fontSize * scaleY);
+      ctx.fillText(t.text, t.x * scaleX, t.y * scaleY + t.fontSize * scaleY);
+    });
+    offscreen.toBlob((blob) => {
+      if (blob) onSave(new File([blob], 'screenshot.png', { type: 'image/png' }));
+    });
+  };
+
+  const toolbarBtn = (label: string, active: boolean, onClick: () => void) => (
+    <button onClick={onClick} style={{
+      padding: '6px 14px', border: 'none', borderRadius: '4px', cursor: 'pointer',
+      background: active ? '#007AFF' : '#555', color: 'white', fontSize: '13px', fontWeight: active ? 'bold' : 'normal',
+    }}>{label}</button>
+  );
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 10001, background: 'rgba(0,0,0,0.85)',
+      display: 'flex', flexDirection: 'column',
+    }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px',
+        background: '#1a1a1a', borderBottom: '1px solid #333', flexWrap: 'wrap',
+      }}>
+        {toolbarBtn('Pen', tool === 'pen', () => setTool('pen'))}
+        {toolbarBtn('Text', tool === 'text', () => setTool('text'))}
+        {toolbarBtn('Eraser', tool === 'eraser', () => setTool('eraser'))}
+        <span style={{ width: '1px', height: '24px', background: '#555', margin: '0 4px' }} />
+        {ANNOTATION_COLORS.map(c => (
+          <button key={c} onClick={() => setColor(c)} style={{
+            width: '24px', height: '24px', borderRadius: '50%', border: color === c ? '3px solid white' : '2px solid #666',
+            background: c, cursor: 'pointer', padding: 0,
+          }} />
+        ))}
+        <span style={{ flex: 1 }} />
+        <button onClick={handleSave} style={{
+          padding: '6px 18px', background: '#34C759', color: 'white', border: 'none',
+          borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px',
+        }}>Save</button>
+        <button onClick={onCancel} style={{
+          padding: '6px 12px', background: '#666', color: 'white', border: 'none',
+          borderRadius: '4px', cursor: 'pointer', fontSize: '13px',
+        }}>X</button>
+      </div>
+      <div style={{ flex: 1, overflow: 'auto', display: 'flex', justifyContent: 'center', alignItems: 'flex-start', padding: '20px' }}>
+        {imgSize.w > 0 && (
+          <div ref={containerRef} style={{ position: 'relative', display: 'inline-block' }}>
+            <canvas
+              ref={canvasRef}
+              width={imgSize.w}
+              height={imgSize.h}
+              style={{ maxWidth: '100%', maxHeight: 'calc(100vh - 100px)', display: 'block', cursor: tool === 'pen' ? 'crosshair' : tool === 'eraser' ? 'pointer' : 'text' }}
+              onMouseDown={handlePointerDown}
+              onMouseMove={handlePointerMove}
+              onMouseUp={handlePointerUp}
+              onMouseLeave={handlePointerUp}
+              onTouchStart={handlePointerDown}
+              onTouchMove={handlePointerMove}
+              onTouchEnd={handlePointerUp}
+            />
+            {texts.map(t => (
+              <div
+                key={t.id}
+                contentEditable
+                suppressContentEditableWarning
+                onBlur={(e) => handleTextBlur(t.id, e.currentTarget.innerText)}
+                onDoubleClick={(e) => { e.currentTarget.focus(); }}
+                style={{
+                  position: 'absolute', left: t.x, top: t.y,
+                  color: t.color, fontSize: t.fontSize, fontWeight: 'bold', fontFamily: 'sans-serif',
+                  background: 'rgba(0,0,0,0.3)', padding: '2px 4px', borderRadius: '2px',
+                  outline: 'none', minWidth: '20px', cursor: 'text', whiteSpace: 'pre',
+                  textShadow: '1px 1px 2px rgba(0,0,0,0.8)',
+                }}
+                ref={(el) => { if (el && !t.text) el.focus(); }}
+              >{t.text}</div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// --- Main Component ---
 export function BugReportButton({ apiUrl, apiKey, projectSlug, reporter = 'anonymous' }: BugReportProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [title, setTitle] = useState('');
@@ -144,19 +399,29 @@ export function BugReportButton({ apiUrl, apiKey, projectSlug, reporter = 'anony
   const [screenshot, setScreenshot] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
+  const [annotatorOpen, setAnnotatorOpen] = useState(false);
+  const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
 
   const captureScreenshot = async () => {
     try {
       const html2canvas = (await import('html2canvas')).default;
       const canvas = await html2canvas(document.body);
-      canvas.toBlob((blob) => {
-        if (blob) {
-          setScreenshot(new File([blob], 'screenshot.png', { type: 'image/png' }));
-        }
-      });
+      setScreenshotDataUrl(canvas.toDataURL('image/png'));
+      setAnnotatorOpen(true);
     } catch (e) {
       console.error('Screenshot capture failed:', e);
     }
+  };
+
+  const handleAnnotationSave = (file: File) => {
+    setScreenshot(file);
+    setAnnotatorOpen(false);
+    setScreenshotDataUrl(null);
+  };
+
+  const handleAnnotationCancel = () => {
+    setAnnotatorOpen(false);
+    setScreenshotDataUrl(null);
   };
 
   const submit = async () => {
@@ -212,6 +477,11 @@ export function BugReportButton({ apiUrl, apiKey, projectSlug, reporter = 'anony
       setLoading(false);
     }
   };
+
+  // Show annotation editor fullscreen
+  if (annotatorOpen && screenshotDataUrl) {
+    return <AnnotationEditor imageDataUrl={screenshotDataUrl} onSave={handleAnnotationSave} onCancel={handleAnnotationCancel} />;
+  }
 
   if (!isOpen) {
     return (
@@ -323,9 +593,47 @@ function App() {
 ```vue
 <template>
   <div>
-    <button v-if="!isOpen" @click="isOpen = true" class="bug-btn">Bug</button>
+    <!-- Annotation Editor (fullscreen overlay) -->
+    <div v-if="annotatorOpen && screenshotDataUrl" class="annotation-overlay">
+      <div class="annotation-toolbar">
+        <button :class="['tool-btn', { active: annotationTool === 'pen' }]" @click="annotationTool = 'pen'">Pen</button>
+        <button :class="['tool-btn', { active: annotationTool === 'text' }]" @click="annotationTool = 'text'">Text</button>
+        <button :class="['tool-btn', { active: annotationTool === 'eraser' }]" @click="annotationTool = 'eraser'">Eraser</button>
+        <span class="toolbar-sep" />
+        <button v-for="c in annotationColors" :key="c" class="color-dot"
+          :style="{ background: c, border: annotationColor === c ? '3px solid white' : '2px solid #666' }"
+          @click="annotationColor = c" />
+        <span class="toolbar-spacer" />
+        <button class="save-btn" @click="saveAnnotation">Save</button>
+        <button class="cancel-btn" @click="cancelAnnotation">X</button>
+      </div>
+      <div class="annotation-area">
+        <div ref="annotationContainer" class="annotation-container" v-if="annotationImgSize.w > 0">
+          <canvas ref="annotationCanvas"
+            :width="annotationImgSize.w" :height="annotationImgSize.h"
+            :style="{ maxWidth: '100%', maxHeight: 'calc(100vh - 100px)', display: 'block', cursor: annotationTool === 'pen' ? 'crosshair' : annotationTool === 'eraser' ? 'pointer' : 'text' }"
+            @mousedown="onAnnotationPointerDown" @mousemove="onAnnotationPointerMove"
+            @mouseup="onAnnotationPointerUp" @mouseleave="onAnnotationPointerUp"
+            @touchstart.prevent="onAnnotationPointerDown" @touchmove.prevent="onAnnotationPointerMove"
+            @touchend="onAnnotationPointerUp" />
+          <div v-for="t in annotationTexts" :key="t.id"
+            contenteditable @blur="onTextBlur(t.id, $event)"
+            @dblclick="($event.target as HTMLElement).focus()"
+            :ref="(el) => { if (el && !t.text) (el as HTMLElement).focus(); }"
+            :style="{
+              position: 'absolute', left: t.x + 'px', top: t.y + 'px',
+              color: t.color, fontSize: t.fontSize + 'px', fontWeight: 'bold', fontFamily: 'sans-serif',
+              background: 'rgba(0,0,0,0.3)', padding: '2px 4px', borderRadius: '2px',
+              outline: 'none', minWidth: '20px', cursor: 'text', whiteSpace: 'pre',
+              textShadow: '1px 1px 2px rgba(0,0,0,0.8)',
+            }">{{ t.text }}</div>
+        </div>
+      </div>
+    </div>
 
-    <div v-if="isOpen" class="bug-modal">
+    <button v-if="!isOpen && !annotatorOpen" @click="isOpen = true" class="bug-btn">Bug</button>
+
+    <div v-if="isOpen && !annotatorOpen" class="bug-modal">
       <div v-if="success" class="success">
         <p>Bug reported!</p>
       </div>
@@ -360,7 +668,7 @@ function App() {
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, watch, nextTick } from 'vue';
 
 const props = defineProps<{
   apiUrl: string;
@@ -377,12 +685,168 @@ const screenshot = ref<File | null>(null);
 const loading = ref(false);
 const success = ref(false);
 
+// Annotation editor state
+const annotatorOpen = ref(false);
+const screenshotDataUrl = ref<string | null>(null);
+const annotationCanvas = ref<HTMLCanvasElement | null>(null);
+const annotationContainer = ref<HTMLDivElement | null>(null);
+const annotationTool = ref<'pen' | 'text' | 'eraser'>('pen');
+const annotationColor = ref('#FF3B30');
+const annotationColors = ['#FF3B30', '#007AFF', '#34C759', '#FFCC00', '#FFFFFF'];
+const annotationStrokes = ref<{ points: {x:number;y:number}[]; color: string; width: number; isErased: boolean }[]>([]);
+const annotationTexts = ref<{ id: string; x: number; y: number; text: string; color: string; fontSize: number }[]>([]);
+const annotationImgSize = ref({ w: 0, h: 0 });
+let annotationImg: HTMLImageElement | null = null;
+let currentStroke: { points: {x:number;y:number}[]; color: string; width: number; isErased: boolean } | null = null;
+let isDrawing = false;
+
 const captureScreenshot = async () => {
   const html2canvas = (await import('html2canvas')).default;
   const canvas = await html2canvas(document.body);
-  canvas.toBlob((blob) => {
-    if (blob) screenshot.value = new File([blob], 'screenshot.png', { type: 'image/png' });
+  screenshotDataUrl.value = canvas.toDataURL('image/png');
+  annotatorOpen.value = true;
+  const img = new Image();
+  img.onload = () => {
+    annotationImg = img;
+    annotationImgSize.value = { w: img.width, h: img.height };
+    annotationStrokes.value = [];
+    annotationTexts.value = [];
+    nextTick(() => redrawAnnotation());
+  };
+  img.src = screenshotDataUrl.value;
+};
+
+const redrawAnnotation = () => {
+  const canvas = annotationCanvas.value;
+  if (!canvas || !annotationImg) return;
+  const ctx = canvas.getContext('2d')!;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(annotationImg, 0, 0);
+  annotationStrokes.value.forEach(s => {
+    if (s.isErased || s.points.length < 2) return;
+    ctx.beginPath();
+    ctx.strokeStyle = s.color; ctx.lineWidth = s.width;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.moveTo(s.points[0].x, s.points[0].y);
+    s.points.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+    ctx.stroke();
   });
+};
+
+watch(annotationStrokes, () => redrawAnnotation(), { deep: true });
+
+const getAnnotationCoords = (e: MouseEvent | TouchEvent) => {
+  const canvas = annotationCanvas.value!;
+  const rect = canvas.getBoundingClientRect();
+  const clientX = 'touches' in e ? (e as TouchEvent).touches[0].clientX : (e as MouseEvent).clientX;
+  const clientY = 'touches' in e ? (e as TouchEvent).touches[0].clientY : (e as MouseEvent).clientY;
+  return {
+    x: (clientX - rect.left) * (canvas.width / rect.width),
+    y: (clientY - rect.top) * (canvas.height / rect.height),
+  };
+};
+
+const onAnnotationPointerDown = (e: MouseEvent | TouchEvent) => {
+  if (annotationTool.value === 'text') e.preventDefault(); // Prevent canvas from stealing focus from contenteditable
+  const pos = getAnnotationCoords(e);
+  if (annotationTool.value === 'pen') {
+    currentStroke = { points: [pos], color: annotationColor.value, width: 3, isErased: false };
+    isDrawing = true;
+  } else if (annotationTool.value === 'eraser') {
+    const updated = [...annotationStrokes.value];
+    for (let i = updated.length - 1; i >= 0; i--) {
+      if (updated[i].isErased) continue;
+      if (updated[i].points.some(p => Math.hypot(p.x - pos.x, p.y - pos.y) < 12)) {
+        updated[i] = { ...updated[i], isErased: true }; break;
+      }
+    }
+    annotationStrokes.value = updated;
+  } else if (annotationTool.value === 'text') {
+    const canvas = annotationCanvas.value!;
+    const rect = canvas.getBoundingClientRect();
+    const cssX = pos.x * (rect.width / canvas.width);
+    const cssY = pos.y * (rect.height / canvas.height);
+    annotationTexts.value.push({ id: 'txt-' + Date.now(), x: cssX, y: cssY, text: '', color: annotationColor.value, fontSize: 16 });
+  }
+};
+
+const onAnnotationPointerMove = (e: MouseEvent | TouchEvent) => {
+  if (!isDrawing || annotationTool.value !== 'pen' || !currentStroke) return;
+  const pos = getAnnotationCoords(e);
+  currentStroke.points.push(pos);
+  const canvas = annotationCanvas.value!;
+  const ctx = canvas.getContext('2d')!;
+  const pts = currentStroke.points;
+  if (pts.length >= 2) {
+    ctx.beginPath();
+    ctx.strokeStyle = currentStroke.color; ctx.lineWidth = currentStroke.width; ctx.lineCap = 'round';
+    ctx.moveTo(pts[pts.length - 2].x, pts[pts.length - 2].y);
+    ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+    ctx.stroke();
+  }
+};
+
+const onAnnotationPointerUp = () => {
+  if (isDrawing && currentStroke && currentStroke.points.length >= 2) {
+    annotationStrokes.value = [...annotationStrokes.value, currentStroke];
+  }
+  currentStroke = null;
+  isDrawing = false;
+};
+
+const onTextBlur = (id: string, e: Event) => {
+  const el = e.target as HTMLElement;
+  const text = el.innerText;
+  if (!text.trim()) {
+    // Delay removal to avoid race condition with mouseup stealing focus
+    setTimeout(() => {
+      if (!el.innerText.trim()) {
+        annotationTexts.value = annotationTexts.value.filter(t => t.id !== id);
+      }
+    }, 200);
+  } else {
+    annotationTexts.value = annotationTexts.value.map(t => t.id === id ? { ...t, text } : t);
+  }
+};
+
+const saveAnnotation = () => {
+  if (!annotationImg) return;
+  const offscreen = document.createElement('canvas');
+  offscreen.width = annotationImg.width;
+  offscreen.height = annotationImg.height;
+  const ctx = offscreen.getContext('2d')!;
+  ctx.drawImage(annotationImg, 0, 0);
+  annotationStrokes.value.forEach(s => {
+    if (s.isErased || s.points.length < 2) return;
+    ctx.beginPath(); ctx.strokeStyle = s.color; ctx.lineWidth = s.width;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.moveTo(s.points[0].x, s.points[0].y);
+    s.points.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+    ctx.stroke();
+  });
+  const displayCanvas = annotationCanvas.value!;
+  const rect = displayCanvas.getBoundingClientRect();
+  const scaleX = annotationImg.width / rect.width;
+  const scaleY = annotationImg.height / rect.height;
+  annotationTexts.value.forEach(t => {
+    if (!t.text.trim()) return;
+    ctx.font = `bold ${t.fontSize * scaleY}px sans-serif`;
+    ctx.fillStyle = t.color; ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 3;
+    ctx.strokeText(t.text, t.x * scaleX, t.y * scaleY + t.fontSize * scaleY);
+    ctx.fillText(t.text, t.x * scaleX, t.y * scaleY + t.fontSize * scaleY);
+  });
+  offscreen.toBlob((blob) => {
+    if (blob) {
+      screenshot.value = new File([blob], 'screenshot.png', { type: 'image/png' });
+      annotatorOpen.value = false;
+      screenshotDataUrl.value = null;
+    }
+  });
+};
+
+const cancelAnnotation = () => {
+  annotatorOpen.value = false;
+  screenshotDataUrl.value = null;
 };
 
 const submit = async () => {
@@ -434,6 +898,9 @@ const submit = async () => {
 Drop this snippet before `</body>` in any HTML page:
 
 ```html
+<!-- Required for screenshot capture -->
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+
 <div id="bug-report-widget"></div>
 <script>
 (function() {
@@ -441,6 +908,16 @@ Drop this snippet before `</body>` in any HTML page:
   const BUGS_API_URL = 'http://localhost:9010';
   const API_KEY = 'YOUR_PROJECT_API_KEY';
   const REPORTER = 'anonymous';
+  const ANNOTATION_COLORS = ['#FF3B30', '#007AFF', '#34C759', '#FFCC00', '#FFFFFF'];
+
+  let screenshotFile = null;
+  let annotationImg = null;
+  let annotationStrokes = [];
+  let annotationTexts = [];
+  let annotationTool = 'pen';
+  let annotationColor = ANNOTATION_COLORS[0];
+  let currentStroke = null;
+  let isDrawing = false;
 
   const style = document.createElement('style');
   style.textContent = `
@@ -456,6 +933,20 @@ Drop this snippet before `</body>` in any HTML page:
       border:none; border-radius:6px; cursor:pointer; }
     #bug-modal .header { display:flex; justify-content:space-between; margin-bottom:16px; }
     #bug-modal .close { background:none; border:none; cursor:pointer; font-size:18px; }
+    #bug-annotation-overlay { position:fixed; inset:0; z-index:10001; background:rgba(0,0,0,0.85); display:none; flex-direction:column; }
+    #bug-annotation-overlay.open { display:flex; }
+    #bug-annotation-toolbar { display:flex; align-items:center; gap:8px; padding:10px 16px; background:#1a1a1a; border-bottom:1px solid #333; flex-wrap:wrap; }
+    #bug-annotation-toolbar .tool-btn { padding:6px 14px; border:none; border-radius:4px; cursor:pointer; background:#555; color:white; font-size:13px; }
+    #bug-annotation-toolbar .tool-btn.active { background:#007AFF; font-weight:bold; }
+    #bug-annotation-toolbar .color-dot { width:24px; height:24px; border-radius:50%; cursor:pointer; padding:0; }
+    #bug-annotation-toolbar .sep { width:1px; height:24px; background:#555; margin:0 4px; }
+    #bug-annotation-toolbar .spacer { flex:1; }
+    #bug-annotation-toolbar .save-btn { padding:6px 18px; background:#34C759; color:white; border:none; border-radius:4px; cursor:pointer; font-weight:bold; font-size:13px; }
+    #bug-annotation-toolbar .cancel-btn { padding:6px 12px; background:#666; color:white; border:none; border-radius:4px; cursor:pointer; font-size:13px; }
+    #bug-annotation-area { flex:1; overflow:auto; display:flex; justify-content:center; align-items:flex-start; padding:20px; }
+    #bug-annotation-container { position:relative; display:inline-block; }
+    #bug-annotation-container canvas { max-width:100%; max-height:calc(100vh - 100px); display:block; }
+    .bug-text-annotation { position:absolute; font-weight:bold; font-family:sans-serif; background:rgba(0,0,0,0.3); padding:2px 4px; border-radius:2px; outline:none; min-width:20px; cursor:text; white-space:pre; text-shadow:1px 1px 2px rgba(0,0,0,0.8); }
   `;
   document.head.appendChild(style);
 
@@ -479,9 +970,221 @@ Drop this snippet before `</body>` in any HTML page:
         <option value="haute">High</option>
         <option value="critique">Critical</option>
       </select>
+      <div style="margin-bottom:16px">
+        <button onclick="captureBugScreenshot()" style="margin-right:8px;padding:8px 12px">Capture screenshot</button>
+        <span id="bug-screenshot-status" style="color:green;display:none">Ready</span>
+      </div>
       <button class="submit" onclick="submitBugReport()">Send report</button>
     </div>
+    <div id="bug-annotation-overlay">
+      <div id="bug-annotation-toolbar"></div>
+      <div id="bug-annotation-area">
+        <div id="bug-annotation-container"></div>
+      </div>
+    </div>
   `;
+
+  function buildToolbar() {
+    const tb = document.getElementById('bug-annotation-toolbar');
+    tb.innerHTML = '';
+    ['pen', 'text', 'eraser'].forEach(t => {
+      const labels = { pen: 'Pen', text: 'Text', eraser: 'Eraser' };
+      const btn = document.createElement('button');
+      btn.className = 'tool-btn' + (annotationTool === t ? ' active' : '');
+      btn.textContent = labels[t];
+      btn.onclick = () => { annotationTool = t; buildToolbar(); updateCanvasCursor(); };
+      tb.appendChild(btn);
+    });
+    const sep = document.createElement('span'); sep.className = 'sep'; tb.appendChild(sep);
+    ANNOTATION_COLORS.forEach(c => {
+      const dot = document.createElement('button');
+      dot.className = 'color-dot'; dot.style.background = c;
+      dot.style.border = annotationColor === c ? '3px solid white' : '2px solid #666';
+      dot.onclick = () => { annotationColor = c; buildToolbar(); };
+      tb.appendChild(dot);
+    });
+    const spacer = document.createElement('span'); spacer.className = 'spacer'; tb.appendChild(spacer);
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'save-btn'; saveBtn.textContent = 'Save'; saveBtn.onclick = saveAnnotation;
+    tb.appendChild(saveBtn);
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'cancel-btn'; cancelBtn.textContent = 'X'; cancelBtn.onclick = cancelAnnotation;
+    tb.appendChild(cancelBtn);
+  }
+
+  function updateCanvasCursor() {
+    const canvas = document.getElementById('bug-annotation-canvas');
+    if (canvas) canvas.style.cursor = annotationTool === 'pen' ? 'crosshair' : annotationTool === 'eraser' ? 'pointer' : 'text';
+  }
+
+  function redrawAnnotation() {
+    const canvas = document.getElementById('bug-annotation-canvas');
+    if (!canvas || !annotationImg) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(annotationImg, 0, 0);
+    annotationStrokes.forEach(s => {
+      if (s.isErased || s.points.length < 2) return;
+      ctx.beginPath(); ctx.strokeStyle = s.color; ctx.lineWidth = s.width;
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.moveTo(s.points[0].x, s.points[0].y);
+      s.points.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+      ctx.stroke();
+    });
+  }
+
+  function getAnnotationCoords(e) {
+    const canvas = document.getElementById('bug-annotation-canvas');
+    const rect = canvas.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    return {
+      x: (clientX - rect.left) * (canvas.width / rect.width),
+      y: (clientY - rect.top) * (canvas.height / rect.height),
+    };
+  }
+
+  function onAnnotationDown(e) {
+    if (e.touches) e.preventDefault();
+    if (annotationTool === 'text') e.preventDefault(); // Prevent canvas from stealing focus from contenteditable
+    const pos = getAnnotationCoords(e);
+    if (annotationTool === 'pen') {
+      currentStroke = { points: [pos], color: annotationColor, width: 3, isErased: false };
+      isDrawing = true;
+    } else if (annotationTool === 'eraser') {
+      for (let i = annotationStrokes.length - 1; i >= 0; i--) {
+        if (annotationStrokes[i].isErased) continue;
+        if (annotationStrokes[i].points.some(p => Math.hypot(p.x - pos.x, p.y - pos.y) < 12)) {
+          annotationStrokes[i].isErased = true; redrawAnnotation(); break;
+        }
+      }
+    } else if (annotationTool === 'text') {
+      const canvas = document.getElementById('bug-annotation-canvas');
+      const rect = canvas.getBoundingClientRect();
+      const cssX = pos.x * (rect.width / canvas.width);
+      const cssY = pos.y * (rect.height / canvas.height);
+      const id = 'txt-' + Date.now();
+      annotationTexts.push({ id, x: cssX, y: cssY, text: '', color: annotationColor, fontSize: 16 });
+      createTextDiv(annotationTexts[annotationTexts.length - 1]);
+    }
+  }
+
+  function onAnnotationMove(e) {
+    if (e.touches) e.preventDefault();
+    if (!isDrawing || annotationTool !== 'pen' || !currentStroke) return;
+    const pos = getAnnotationCoords(e);
+    currentStroke.points.push(pos);
+    const canvas = document.getElementById('bug-annotation-canvas');
+    const ctx = canvas.getContext('2d');
+    const pts = currentStroke.points;
+    if (pts.length >= 2) {
+      ctx.beginPath(); ctx.strokeStyle = currentStroke.color; ctx.lineWidth = currentStroke.width; ctx.lineCap = 'round';
+      ctx.moveTo(pts[pts.length - 2].x, pts[pts.length - 2].y);
+      ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+      ctx.stroke();
+    }
+  }
+
+  function onAnnotationUp() {
+    if (isDrawing && currentStroke && currentStroke.points.length >= 2) annotationStrokes.push(currentStroke);
+    currentStroke = null; isDrawing = false;
+  }
+
+  function createTextDiv(t) {
+    const container = document.getElementById('bug-annotation-container');
+    const div = document.createElement('div');
+    div.className = 'bug-text-annotation';
+    div.contentEditable = 'true';
+    div.style.left = t.x + 'px'; div.style.top = t.y + 'px';
+    div.style.color = t.color; div.style.fontSize = t.fontSize + 'px';
+    div.dataset.id = t.id; div.textContent = t.text;
+    div.addEventListener('blur', function() {
+      const el = this;
+      const text = el.innerText;
+      if (!text.trim()) {
+        // Delay removal to avoid race condition with mouseup stealing focus
+        setTimeout(function() {
+          if (!el.innerText.trim()) {
+            const idx = annotationTexts.findIndex(at => at.id === t.id);
+            if (idx !== -1) annotationTexts.splice(idx, 1);
+            el.remove();
+          }
+        }, 200);
+      } else {
+        const idx = annotationTexts.findIndex(at => at.id === t.id);
+        if (idx !== -1) annotationTexts[idx].text = text;
+      }
+    });
+    div.addEventListener('dblclick', function() { this.focus(); });
+    container.appendChild(div); div.focus();
+  }
+
+  function saveAnnotation() {
+    if (!annotationImg) return;
+    const offscreen = document.createElement('canvas');
+    offscreen.width = annotationImg.width; offscreen.height = annotationImg.height;
+    const ctx = offscreen.getContext('2d');
+    ctx.drawImage(annotationImg, 0, 0);
+    annotationStrokes.forEach(s => {
+      if (s.isErased || s.points.length < 2) return;
+      ctx.beginPath(); ctx.strokeStyle = s.color; ctx.lineWidth = s.width;
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.moveTo(s.points[0].x, s.points[0].y);
+      s.points.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+      ctx.stroke();
+    });
+    const displayCanvas = document.getElementById('bug-annotation-canvas');
+    const rect = displayCanvas.getBoundingClientRect();
+    const scaleX = annotationImg.width / rect.width;
+    const scaleY = annotationImg.height / rect.height;
+    annotationTexts.forEach(t => {
+      if (!t.text.trim()) return;
+      ctx.font = `bold ${t.fontSize * scaleY}px sans-serif`;
+      ctx.fillStyle = t.color; ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 3;
+      ctx.strokeText(t.text, t.x * scaleX, t.y * scaleY + t.fontSize * scaleY);
+      ctx.fillText(t.text, t.x * scaleX, t.y * scaleY + t.fontSize * scaleY);
+    });
+    offscreen.toBlob(function(blob) {
+      if (blob) {
+        screenshotFile = new File([blob], 'screenshot.png', { type: 'image/png' });
+        document.getElementById('bug-screenshot-status').style.display = 'inline';
+        cancelAnnotation();
+      }
+    });
+  }
+
+  function cancelAnnotation() {
+    document.getElementById('bug-annotation-overlay').classList.remove('open');
+    annotationStrokes = []; annotationTexts = []; annotationImg = null;
+  }
+
+  window.captureBugScreenshot = async function() {
+    try {
+      const canvas = await html2canvas(document.body);
+      const dataUrl = canvas.toDataURL('image/png');
+      annotationStrokes = []; annotationTexts = [];
+      annotationTool = 'pen'; annotationColor = ANNOTATION_COLORS[0];
+      const img = new Image();
+      img.onload = function() {
+        annotationImg = img;
+        const container = document.getElementById('bug-annotation-container');
+        container.innerHTML = '<canvas id="bug-annotation-canvas"></canvas>';
+        const c = document.getElementById('bug-annotation-canvas');
+        c.width = img.width; c.height = img.height;
+        updateCanvasCursor();
+        c.addEventListener('mousedown', onAnnotationDown);
+        c.addEventListener('mousemove', onAnnotationMove);
+        c.addEventListener('mouseup', onAnnotationUp);
+        c.addEventListener('mouseleave', onAnnotationUp);
+        c.addEventListener('touchstart', onAnnotationDown, { passive: false });
+        c.addEventListener('touchmove', onAnnotationMove, { passive: false });
+        c.addEventListener('touchend', onAnnotationUp);
+        redrawAnnotation(); buildToolbar();
+        document.getElementById('bug-annotation-overlay').classList.add('open');
+      };
+      img.src = dataUrl;
+    } catch (e) { console.error('Screenshot failed:', e); }
+  };
 
   document.getElementById('bug-btn').onclick = () => {
     document.getElementById('bug-modal').classList.add('open');
@@ -514,10 +1217,22 @@ Drop this snippet before `</body>` in any HTML page:
     });
 
     if (res.ok) {
+      const issue = await res.json();
+      if (screenshotFile && issue.reference) {
+        const formData = new FormData();
+        formData.append('file', screenshotFile);
+        await fetch(BUGS_API_URL + '/api/v1/issues/' + issue.reference + '/attachments', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + API_KEY },
+          body: formData,
+        });
+      }
       alert('Bug reported!');
       closeBugModal();
       document.getElementById('bug-title').value = '';
       document.getElementById('bug-desc').value = '';
+      screenshotFile = null;
+      document.getElementById('bug-screenshot-status').style.display = 'none';
     }
   };
 })();
@@ -546,14 +1261,24 @@ The button automatically sends `context_data` with every report:
 
 This helps developers reproduce bugs by knowing exactly where the user was.
 
-### Screenshot Capture
+### Screenshot Capture & Annotation
 
-The React and Vue components include screenshot capture via `html2canvas`. When the user clicks "Capture screenshot":
+All three components (React, Vue, vanilla HTML) include screenshot capture via `html2canvas` with a built-in **annotation editor**. When the user clicks "Capture screenshot":
 
 1. `html2canvas` renders the current DOM to a canvas
-2. The canvas is converted to a PNG blob
-3. After issue creation, the PNG is uploaded as an attachment via `POST /api/v1/issues/{ref}/attachments`
-4. The screenshot appears in the issue detail view with auto-generated thumbnail
+2. A **fullscreen annotation editor** opens with the captured image
+3. The user can annotate the screenshot using:
+   - **Pen tool** — free-draw on the image (3px stroke, `lineCap: round`)
+   - **Text tool** — click to place editable text labels (`contenteditable` divs)
+   - **Eraser tool** — click on a stroke to remove it entirely (not white paint)
+   - **5 colors** — Red `#FF3B30`, Blue `#007AFF`, Green `#34C759`, Yellow `#FFCC00`, White `#FFFFFF`
+4. Double-click on existing text to re-edit it
+5. Click **Save** to flatten everything (image + strokes + text) into a final PNG
+6. The annotated PNG replaces the original screenshot — no further editing possible
+7. After issue creation, the PNG is uploaded as an attachment via `POST /api/v1/issues/{ref}/attachments`
+8. The screenshot appears in the issue detail view with auto-generated thumbnail
+
+The annotation editor uses a hybrid Canvas + HTML approach: strokes are drawn on a `<canvas>`, while text annotations are `contenteditable` divs positioned over the canvas for native text editing. Touch events (`touchstart`/`touchmove`/`touchend`) are supported for mobile/tablet use.
 
 **Note:** `html2canvas` does not capture cross-origin images, WebGL canvases, or iframes. For those cases, consider using the browser's native `navigator.mediaDevices.getDisplayMedia()` API.
 
