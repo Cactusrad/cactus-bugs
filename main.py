@@ -5,6 +5,7 @@ Bugs Service - Centralized bug/suggestion tracking API.
 import os
 import secrets
 import threading
+import ipaddress
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -159,9 +160,20 @@ class UserResponse(BaseModel):
 # ============ Auth Dependencies ============
 
 ADMIN_MASTER_KEY = os.environ.get("ADMIN_MASTER_KEY", "dev_master_key_change_me")
+LOCAL_SUBNET = ipaddress.ip_network('192.168.1.0/24')
 
 
 import base64
+
+
+def _is_local_network(request: Request) -> bool:
+    """Check if request comes from the local subnet."""
+    ip_str = request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', request.client.host)
+    ip_str = ip_str.split(',')[0].strip()
+    try:
+        return ipaddress.ip_address(ip_str) in LOCAL_SUBNET
+    except ValueError:
+        return False
 
 
 def _parse_basic_auth(auth_header: str, db: Session) -> Optional[User]:
@@ -184,6 +196,10 @@ def get_current_project(
 ) -> Optional[Project]:
     """Verify auth and return project (or None for admin/user auth)."""
     auth = request.headers.get("Authorization", "")
+
+    # Local network = admin-level access (no auth needed)
+    if not auth and _is_local_network(request):
+        return None
 
     # Basic auth — user/password
     if auth.startswith("Basic "):
@@ -221,6 +237,10 @@ def _get_authenticated_user(request: Request, db: Session = Depends(get_db)) -> 
 
 def require_admin(request: Request, db: Session = Depends(get_db)):
     """Require admin access (master key or admin user)."""
+    # Local network = admin access
+    if _is_local_network(request):
+        return
+
     auth = request.headers.get("Authorization", "")
 
     if auth.startswith("Basic "):
