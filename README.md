@@ -1454,6 +1454,11 @@ All endpoints (except `/health`) require authentication:
 | Bearer token (API key) | `Authorization: Bearer {API_KEY}` | Project-scoped |
 | Bearer token (master key) | `Authorization: Bearer {ADMIN_MASTER_KEY}` | Admin (all projects) |
 | Basic auth | `Authorization: Basic {base64(user:pass)}` | User-scoped |
+| Reseau local (192.168.1.0/24) | Aucun header requis | Admin (all projects) |
+
+> **Note** : Les requetes provenant du sous-reseau local (`192.168.1.0/24`) obtiennent un acces admin sans authentification. Le subnet est configurable via `LOCAL_SUBNET` dans `main.py`. L'IP client est detectee via les headers `X-Real-IP` / `X-Forwarded-For` (transmis par nginx) ou `request.client.host`.
+>
+> **Limitation frontend** : Le dashboard React stocke la cle API dans `sessionStorage`. Depuis le reseau local, l'API ne requiert pas d'auth mais le frontend affiche quand meme le formulaire de connexion. Entrer la master key une fois par session suffit.
 
 ### Endpoints
 
