@@ -4,7 +4,7 @@ import secrets
 import hashlib
 from datetime import datetime
 from typing import Optional, List
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Enum, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Enum, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 import enum
 
@@ -104,12 +104,20 @@ class Project(Base):
 
 class Issue(Base):
     __tablename__ = "issues"
+    # Unicité PAR PROJET, pas globale. La prod a été migrée vers ce schéma
+    # (ix_issues_reference_project) parce que des projets différents peuvent
+    # avoir la même référence (ex. BUG-152 dans Rad Quote v3 ET Terminal
+    # Launcher). Le `unique=True` standalone qui était sur `reference`
+    # contredisait la prod et rendait les tests cross-projet impossibles.
+    __table_args__ = (
+        UniqueConstraint("project_id", "reference", name="ix_issues_reference_project"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
 
-    # Reference like RAD-001
-    reference = Column(String(20), unique=True, nullable=False, index=True)
+    # Reference like RAD-001 (unique PER PROJECT, voir __table_args__)
+    reference = Column(String(20), nullable=False, index=True)
 
     # Content
     type = Column(Enum(IssueType), nullable=False, default=IssueType.BUG)

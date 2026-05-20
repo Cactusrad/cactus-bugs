@@ -280,6 +280,44 @@ def require_project(project: Optional[Project] = Depends(get_current_project)) -
     return project
 
 
+def _resolve_project_or_400(
+    request: Request,
+    project_dep: Optional[Project],
+    db: Session,
+) -> Project:
+    """Pour toute route scopée projet (list, get, update, delete, comments,
+    attachments) : exige qu'un projet soit identifiable.
+
+    Source du projet (priorité) :
+    1. Bearer API key — déjà résolu par get_current_project.
+    2. ?project=<slug> dans l'URL — pour admin / LAN bypass.
+    Sinon → 400 avec la liste des slugs valides.
+
+    Sans cette résolution, le bypass LAN (auth implicite local) faisait
+    silencieusement remonter des données cross-projet : ?status=nouveau
+    listait tous les projets, et /issues/{ref}/status pouvait pointer sur
+    n'importe quel projet ayant ce ref (ex. BUG-152 existait dans Rad Quote
+    v3 ET Terminal Launcher → leak).
+    """
+    if project_dep is not None:
+        return project_dep
+    slug = request.query_params.get("project")
+    if not slug:
+        valid = [p.slug for p in db.query(Project).filter(Project.is_active == True).order_by(Project.id).all()]
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "project_required",
+                "message": "Specify project via ?project=<slug> or Authorization: Bearer <project_api_key>",
+                "valid_slugs": valid,
+            },
+        )
+    proj = db.query(Project).filter(Project.slug == slug, Project.is_active == True).first()
+    if not proj:
+        raise HTTPException(status_code=400, detail=f"Unknown project slug: {slug!r}")
+    return proj
+
+
 # ============ Lifespan ============
 
 @asynccontextmanager
@@ -605,6 +643,7 @@ def create_issue(
 
 @app.get("/api/v1/issues", response_model=dict)
 def list_issues(
+    request: Request,
     status: Optional[str] = Query(None, description="Comma-separated statuses"),
     type: Optional[IssueType] = None,
     priority: Optional[Priority] = None,
@@ -614,12 +653,13 @@ def list_issues(
     db: Session = Depends(get_db),
     project: Optional[Project] = Depends(get_current_project)
 ):
-    """List issues with filters."""
-    query = db.query(Issue)
+    """List issues with filters.
 
-    # Filter by project if not admin
-    if project:
-        query = query.filter(Issue.project_id == project.id)
+    Toujours scopé à UN projet : via Bearer key OU ?project=<slug>.
+    Sinon 400 (évite le mélange cross-projet sous bypass LAN).
+    """
+    proj = _resolve_project_or_400(request, project, db)
+    query = db.query(Issue).filter(Issue.project_id == proj.id)
 
     # Apply filters
     if status:
@@ -661,16 +701,16 @@ def list_issues(
 @app.get("/api/v1/issues/{reference}", response_model=dict)
 def get_issue(
     reference: str,
+    request: Request,
     db: Session = Depends(get_db),
     project: Optional[Project] = Depends(get_current_project)
 ):
     """Get issue details with comments and attachments."""
-    query = db.query(Issue).filter(Issue.reference == reference.upper())
-
-    if project:
-        query = query.filter(Issue.project_id == project.id)
-
-    issue = query.first()
+    proj = _resolve_project_or_400(request, project, db)
+    issue = db.query(Issue).filter(
+        Issue.reference == reference.upper(),
+        Issue.project_id == proj.id,
+    ).first()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
 
@@ -699,16 +739,16 @@ def get_issue(
 def update_issue(
     reference: str,
     data: IssueUpdate,
+    request: Request,
     db: Session = Depends(get_db),
     project: Optional[Project] = Depends(get_current_project)
 ):
     """Update issue details."""
-    query = db.query(Issue).filter(Issue.reference == reference.upper())
-
-    if project:
-        query = query.filter(Issue.project_id == project.id)
-
-    issue = query.first()
+    proj = _resolve_project_or_400(request, project, db)
+    issue = db.query(Issue).filter(
+        Issue.reference == reference.upper(),
+        Issue.project_id == proj.id,
+    ).first()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
 
@@ -742,16 +782,16 @@ def update_issue(
 def update_issue_status(
     reference: str,
     data: StatusUpdate,
+    request: Request,
     db: Session = Depends(get_db),
     project: Optional[Project] = Depends(get_current_project)
 ):
     """Update issue status."""
-    query = db.query(Issue).filter(Issue.reference == reference.upper())
-
-    if project:
-        query = query.filter(Issue.project_id == project.id)
-
-    issue = query.first()
+    proj = _resolve_project_or_400(request, project, db)
+    issue = db.query(Issue).filter(
+        Issue.reference == reference.upper(),
+        Issue.project_id == proj.id,
+    ).first()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
 
@@ -799,16 +839,16 @@ def update_issue_status(
 @app.delete("/api/v1/issues/{reference}")
 def delete_issue(
     reference: str,
+    request: Request,
     db: Session = Depends(get_db),
     project: Optional[Project] = Depends(get_current_project)
 ):
     """Delete an issue."""
-    query = db.query(Issue).filter(Issue.reference == reference.upper())
-
-    if project:
-        query = query.filter(Issue.project_id == project.id)
-
-    issue = query.first()
+    proj = _resolve_project_or_400(request, project, db)
+    issue = db.query(Issue).filter(
+        Issue.reference == reference.upper(),
+        Issue.project_id == proj.id,
+    ).first()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
 
@@ -824,16 +864,16 @@ def delete_issue(
 def add_comment(
     reference: str,
     data: CommentCreate,
+    request: Request,
     db: Session = Depends(get_db),
     project: Optional[Project] = Depends(get_current_project)
 ):
     """Add a comment to an issue."""
-    query = db.query(Issue).filter(Issue.reference == reference.upper())
-
-    if project:
-        query = query.filter(Issue.project_id == project.id)
-
-    issue = query.first()
+    proj = _resolve_project_or_400(request, project, db)
+    issue = db.query(Issue).filter(
+        Issue.reference == reference.upper(),
+        Issue.project_id == proj.id,
+    ).first()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
 
@@ -853,16 +893,16 @@ def add_comment(
 @app.get("/api/v1/issues/{reference}/comments", response_model=List[CommentResponse])
 def list_comments(
     reference: str,
+    request: Request,
     db: Session = Depends(get_db),
     project: Optional[Project] = Depends(get_current_project)
 ):
     """List comments for an issue."""
-    query = db.query(Issue).filter(Issue.reference == reference.upper())
-
-    if project:
-        query = query.filter(Issue.project_id == project.id)
-
-    issue = query.first()
+    proj = _resolve_project_or_400(request, project, db)
+    issue = db.query(Issue).filter(
+        Issue.reference == reference.upper(),
+        Issue.project_id == proj.id,
+    ).first()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
 
@@ -874,17 +914,17 @@ def list_comments(
 @app.post("/api/v1/issues/{reference}/attachments", response_model=AttachmentResponse)
 async def upload_attachment(
     reference: str,
+    request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     project: Optional[Project] = Depends(get_current_project)
 ):
     """Upload an attachment to an issue."""
-    query = db.query(Issue).filter(Issue.reference == reference.upper())
-
-    if project:
-        query = query.filter(Issue.project_id == project.id)
-
-    issue = query.first()
+    proj = _resolve_project_or_400(request, project, db)
+    issue = db.query(Issue).filter(
+        Issue.reference == reference.upper(),
+        Issue.project_id == proj.id,
+    ).first()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
 
