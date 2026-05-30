@@ -92,3 +92,92 @@ def test_create_project_duplicate_slug():
         headers=ADMIN_AUTH,
     )
     assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Deduplication / occurrence counting (feat/error-dedup-occurrence)
+# ---------------------------------------------------------------------------
+
+_DEDUP_PROJECT = {}
+
+
+def _project_key():
+    """En-tete Bearer d'un projet partage (cree une seule fois).
+
+    Un seul projet pour tous les tests dedup : sur master `reference` est unique
+    GLOBALEMENT (le fix per-projet est sur une autre branche), donc creer
+    plusieurs projets ferait collisionner les references (BUG-001/ERR-001). Les
+    fingerprints sont distincts par test -> aucune interference de dedup.
+    """
+    if not _DEDUP_PROJECT:
+        resp = client.post(
+            "/api/v1/admin/projects",
+            json={"name": "Dedup Suite", "slug": "dedup-suite"},
+            headers=ADMIN_AUTH,
+        )
+        assert resp.status_code == 200, resp.text
+        _DEDUP_PROJECT["h"] = {"Authorization": f"Bearer {resp.json()['api_key']}"}
+    return _DEDUP_PROJECT["h"]
+
+
+def test_dedup_same_fingerprint_increments():
+    """2 POST meme fingerprint -> 1 seule issue (meme reference), count -> 2."""
+    h = _project_key()
+    payload = {"type": "frontend_error", "title": "TypeError: x is undefined",
+               "fingerprint": "fp-aaa"}
+    r1 = client.post("/api/v1/issues", json=payload, headers=h)
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["occurrence_count"] == 1
+    ref1 = r1.json()["reference"]
+
+    r2 = client.post("/api/v1/issues", json=payload, headers=h)
+    assert r2.status_code == 200
+    assert r2.json()["reference"] == ref1, "doit reutiliser la meme issue"
+    assert r2.json()["occurrence_count"] == 2
+
+
+def test_no_fingerprint_always_creates():
+    """Sans fingerprint -> chaque POST cree une nouvelle issue (legacy)."""
+    h = _project_key()
+    p = {"type": "bug", "title": "Bug manuel"}
+    r1 = client.post("/api/v1/issues", json=p, headers=h)
+    r2 = client.post("/api/v1/issues", json=p, headers=h)
+    assert r1.json()["reference"] != r2.json()["reference"]
+
+
+def test_dedup_different_fingerprints_separate():
+    """Fingerprints differents -> issues distinctes."""
+    h = _project_key()
+    r1 = client.post("/api/v1/issues",
+                     json={"type": "frontend_error", "title": "A", "fingerprint": "f1"},
+                     headers=h)
+    r2 = client.post("/api/v1/issues",
+                     json={"type": "frontend_error", "title": "B", "fingerprint": "f2"},
+                     headers=h)
+    assert r1.json()["reference"] != r2.json()["reference"]
+
+
+def test_frontend_error_reference_prefix():
+    """Le type frontend_error genere une reference ERR-NNN."""
+    h = _project_key()
+    r = client.post("/api/v1/issues",
+                    json={"type": "frontend_error", "title": "E", "fingerprint": "fp-err"},
+                    headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["reference"].startswith("ERR-"), r.json()
+
+
+def test_dedup_recreates_after_resolved():
+    """Une recurrence APRES resolution cree une nouvelle issue (regression)."""
+    h = _project_key()
+    fp = {"type": "frontend_error", "title": "Recurrent", "fingerprint": "fp-recur"}
+    r1 = client.post("/api/v1/issues", json=fp, headers=h)
+    ref1 = r1.json()["reference"]
+    # Resoudre l'issue
+    rs = client.patch(f"/api/v1/issues/{ref1}/status",
+                      json={"status": "termine"}, headers=h)
+    assert rs.status_code == 200, rs.text
+    # Nouvelle occurrence -> nouvelle issue (l'ancienne est fermee)
+    r2 = client.post("/api/v1/issues", json=fp, headers=h)
+    assert r2.json()["reference"] != ref1
+    assert r2.json()["occurrence_count"] == 1

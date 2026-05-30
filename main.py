@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from pydantic import BaseModel, EmailStr
 
-from database import get_db, init_db, SessionLocal
+from database import get_db, init_db, migrate_db, SessionLocal
 from models import (
     Project, Issue, Comment, Attachment, IssueHistory, User,
     IssueType, IssueStatus, Priority, CommentType
@@ -68,6 +68,9 @@ class IssueCreate(BaseModel):
     reporter: Optional[str] = None
     reporter_email: Optional[str] = None
     context_data: Optional[dict] = None
+    # Empreinte de dedup (optionnelle). Si fournie et qu'une issue OUVERTE avec
+    # le meme (projet, fingerprint) existe -> incremente son occurrence_count.
+    fingerprint: Optional[str] = None
 
 
 class IssueUpdate(BaseModel):
@@ -95,6 +98,9 @@ class IssueResponse(BaseModel):
     reporter: Optional[str]
     reporter_email: Optional[str]
     context_data: Optional[dict]
+    fingerprint: Optional[str] = None
+    occurrence_count: int = 1
+    last_seen_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     resolved_at: Optional[datetime]
@@ -167,8 +173,17 @@ import base64
 
 
 def _is_local_network(request: Request) -> bool:
-    """Check if request comes from the local subnet."""
-    ip_str = request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', request.client.host)
+    """Check if request comes from the local subnet.
+
+    `request.client` peut etre None (certains serveurs ASGI, TestClient) -> on
+    garde contre l'AttributeError au lieu de planter en 500 sur chaque requete.
+    """
+    client_host = request.client.host if request.client else None
+    ip_str = (request.headers.get('X-Real-IP')
+              or request.headers.get('X-Forwarded-For')
+              or client_host)
+    if not ip_str:
+        return False
     ip_str = ip_str.split(',')[0].strip()
     try:
         return ipaddress.ip_address(ip_str) in LOCAL_SUBNET
@@ -270,6 +285,7 @@ def require_project(project: Optional[Project] = Depends(get_current_project)) -
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    migrate_db()  # migrations additives (colonnes dedup : fingerprint, occurrence_count, last_seen_at)
     # Create default admin user if no users exist
     db = SessionLocal()
     try:
@@ -485,6 +501,7 @@ TYPE_PREFIXES = {
     "suggestion": "SUG",
     "feature": "FEAT",
     "improvement": "IMP",
+    "frontend_error": "ERR",
 }
 
 def generate_reference(project: Project, issue_type: str, db: Session) -> str:
@@ -501,9 +518,44 @@ def create_issue(
     db: Session = Depends(get_db),
     project: Project = Depends(require_project)
 ):
-    """Create a new issue."""
+    """Create a new issue.
+
+    Deduplication : si `fingerprint` est fourni et qu'une issue OUVERTE
+    (nouveau/en_cours/a_approuver) avec le meme (projet, fingerprint) existe,
+    on incremente son occurrence_count + last_seen_at au lieu de creer un
+    doublon. Une issue deja termine/rejete ne bloque pas : une recurrence
+    apres resolution cree une nouvelle issue (= detection de regression).
+    """
+    _OPEN_STATUSES = (
+        IssueStatus.NOUVEAU, IssueStatus.EN_COURS, IssueStatus.A_APPROUVER,
+    )
+    if data.fingerprint:
+        existing = (
+            db.query(Issue)
+            .filter(
+                Issue.project_id == project.id,
+                Issue.fingerprint == data.fingerprint,
+                Issue.status.in_(_OPEN_STATUSES),
+            )
+            .order_by(Issue.id.desc())
+            .first()
+        )
+        if existing:
+            now = datetime.utcnow()
+            existing.occurrence_count = (existing.occurrence_count or 1) + 1
+            existing.last_seen_at = now
+            existing.updated_at = now
+            db.commit()
+            db.refresh(existing)
+            return IssueResponse(
+                **existing.__dict__,
+                comments_count=len(existing.comments),
+                attachments_count=len(existing.attachments),
+            )
+
     reference = generate_reference(project, data.type, db)
 
+    now = datetime.utcnow()
     issue = Issue(
         project_id=project.id,
         reference=reference,
@@ -513,7 +565,10 @@ def create_issue(
         priority=data.priority,
         reporter=data.reporter,
         reporter_email=data.reporter_email,
-        context_data=data.context_data or {}
+        context_data=data.context_data or {},
+        fingerprint=data.fingerprint,
+        occurrence_count=1,
+        last_seen_at=now,
     )
     db.add(issue)
     db.commit()

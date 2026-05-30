@@ -16,6 +16,7 @@ class IssueType(str, enum.Enum):
     SUGGESTION = "suggestion"
     FEATURE = "feature"
     IMPROVEMENT = "improvement"
+    FRONTEND_ERROR = "frontend_error"  # erreur JS captee automatiquement (window.onerror)
 
 
 class IssueStatus(str, enum.Enum):
@@ -121,6 +122,14 @@ class Issue(Base):
 
     # Context data (URL, user agent, console logs, etc.)
     context_data = Column(JSON, default=dict)
+
+    # Deduplication / occurrence counting (erreurs recurrentes : 500 backend,
+    # erreurs JS frontend). Si `fingerprint` est fourni et qu'une issue OUVERTE
+    # avec le meme (project, fingerprint) existe, on incremente occurrence_count
+    # au lieu de creer un doublon. NULL = pas de dedup (comportement historique).
+    fingerprint = Column(String(64), nullable=True, index=True)
+    occurrence_count = Column(Integer, nullable=False, default=1)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
 
     # People
     assignee = Column(String(100), nullable=True)
