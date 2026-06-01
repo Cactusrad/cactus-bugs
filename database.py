@@ -1,7 +1,7 @@
 """Database configuration for bugs service."""
 
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "/app/data/bugs.db")
@@ -13,6 +13,20 @@ engine = create_engine(
     f"sqlite:///{DATABASE_PATH}",
     connect_args={"check_same_thread": False}
 )
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_conn, _conn_record):
+    """WAL : lecteurs et écrivains ne se bloquent plus (le tracker subit des
+    accès concurrents — page = 3 requêtes // + créations de bugs en fond).
+    Évite les pics de latence vus en mode `delete` (write = verrou global).
+    busy_timeout : attend jusqu'à 15s un verrou au lieu d'échouer tôt.
+    Posé à chaque connexion -> survit aussi à une base recréée."""
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA busy_timeout=15000")
+    cur.close()
+
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
